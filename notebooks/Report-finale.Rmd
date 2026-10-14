@@ -1,0 +1,1689 @@
+---
+title: "Tra Vecchie e Nuove Fonti: Modellazione Econometrica del Mercato Energetico Italiano"
+subtitle: "Relazione per il corso di Modelli Statistici per Dati Economici"
+author: "Giorgia Caicchiolo, Gabriele Paganelli"
+date: "19 gennaio 2026"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+    highlight: tango
+geometry: margin=2.5cm
+fontsize: 11pt
+lang: it-IT
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+
+---
+
+# Introduzione
+
+Il mercato elettrico italiano ha attraversato, nel quinquennio 2021-2025, una fase di straordinaria turbolenza. La crisi energetica globale, unita alla crescente importanza delle fonti rinnovabili, ha reso fondamentale comprendere i meccanismi di formazione del prezzo dell'energia elettrica.
+
+Questo studio analizza le relazioni dinamiche tra tre variabili chiave estratte dai portali istituzionali GME e Terna. Il **Prezzo Unico Nazionale (PUN)** (<https://www.mercatoelettrico.org/it-it/Home/Esiti/Elettricita/MGP/Statistiche/DatiStorici?.com>)rappresenta il prezzo di riferimento dell'energia elettrica alla borsa italiana. Il **prezzo del Gas Naturale**(<https://www.mercatoelettrico.org/en-us/Home/Results/Gas/MGS/StatisticalData/HistoricalData?.com>) costituisce il principale driver del PUN, dato che l'Italia produce ancora una quota significativa di elettricità bruciando gas. Infine, l'**Energia da Fonti Rinnovabili** (<https://dati.terna.it/en/download-center#/load/total-load>) immessa in rete rappresenta la potenza media prodotta da fonti pulite che, avendo costi variabili quasi nulli, tendono ad abbassare il prezzo di borsa quando la loro disponibilità è elevata.
+
+L'obiettivo è indagare come queste serie si influenzano reciprocamente, verificando l'esistenza di un legame stabile nel lungo periodo e misurando la velocità di reazione del sistema a variazioni improvvise della produzione rinnovabile o del costo del gas. L'analisi procede attraverso modelli univariati SARIMA per isolare le componenti stocastiche, test di cointegrazione per verificare i legami di lungo periodo, transfer function models per studiare le risposte dinamiche, e modelli VAR per catturare le interdipendenze multivariate del sistema.
+
+# Setup e Caricamento Dati
+
+## Librerie
+
+```{r setup, message=FALSE, warning=FALSE}
+library(here)
+library(forecast)
+library(dplyr)
+library(readxl)
+library(lubridate)
+library(tidyverse)
+library(vars)
+library(dynlm)
+library(urca)
+library(lmtest)
+library(MTS)
+library(knitr)
+library(kableExtra)
+
+knitr::opts_chunk$set(
+  dpi = 300, 
+  fig.align = "center",
+  out.width = "100%"
+)
+
+options(digits = 4)
+options(knitr.table.format = "latex")
+```
+
+## Funzioni Diagnostiche
+
+```{r funzioni}
+acf_plot = function(mod) {
+  par(mfcol = c(1, 2))
+  acf(residuals(mod), main = "ACF Residui", col = "steelblue", lwd = 2)
+  pacf(residuals(mod), main = "PACF Residui", col = "coral", lwd = 2)
+  par(mfcol = c(1, 1))
+}
+
+ljung_box_plot = function(res, max_lag, fitdf = 0) {
+  pvals = sapply(1:max_lag, function(l) 
+    Box.test(res, lag = l, type = "Ljung", fitdf = fitdf)$p.value)
+  plot(pvals, type = "b", ylim = c(0, 1), ylab = "p-value", 
+       xlab = "Lag", main = "Ljung-Box Test", pch = 19, 
+       col = "steelblue", lwd = 2)
+  abline(h = 0.05, col = "red", lty = 2, lwd = 2)
+  grid(col = "gray90")
+}
+```
+
+## Importazione e Preprocessing dei Dati
+
+I dati grezzi vengono standardizzati attraverso allineamento temporale, conversione delle unità in \texteuro{}/MWh e MW, trattamento di outlier e valori mancanti. Le serie PUN e Rinnovabili sono originariamente a frequenza di 15 minuti, mentre il Gas ha frequenza giornaliera, rendendo necessario l'allineamento temporale mediante aggregazione giornaliera delle prime due serie.
+
+```{r import_dati, message=FALSE, warning=FALSE}
+# I dati grezzi (Excel GME/Terna) sono aggregati a serie giornaliera da
+# R/01_preprocessing.R, che produce data/processed/energy_daily.csv.
+# Qui carichiamo direttamente il file processato (vedi README, sezione Dataset).
+energy = readr::read_csv(here("data", "processed", "energy_daily.csv"),
+                         show_col_types = FALSE)
+
+prezzo_gas   = dplyr::transmute(energy, data, prezzo = gas)
+pun_series   = dplyr::transmute(energy, data, prezzo = pun)
+renew_series = dplyr::transmute(energy, data, prezzo = renew)
+```
+
+## Creazione delle Serie Temporali
+
+```{r create_ts}
+gas_ts = ts(prezzo_gas$prezzo, start = c(2021, 1), frequency = 7)
+pun_ts = ts(pun_series$prezzo, start = c(2021, 1), frequency = 7)
+renew_ts = ts(renew_series$prezzo, start = c(2021, 1), frequency = 7)
+```
+
+```{r plot_series, fig.width=8, fig.height=9, out.width="100%"}
+par(mfrow = c(3, 1))
+
+ts.plot(pun_ts, main = "Prezzo dell'energia elettrica (PUN)", 
+        ylab = "Euro/MWh", xlab = "", col = "darkblue", lwd = 1.5, 
+        cex.main = 1.1, cex.lab = 1.05)
+grid(col = "gray85", lty = "dotted")
+
+ts.plot(gas_ts, main = "Prezzo del Gas Naturale", 
+        ylab = "Euro/MWh", xlab = "", col = "darkred", lwd = 1.5,
+        cex.main = 1.1, cex.lab = 1.05)
+grid(col = "gray85", lty = "dotted")
+
+ts.plot(renew_ts, main = "Energia Rinnovabile immessa", 
+        ylab = "MW", xlab = "Tempo", col = "darkgreen", lwd = 1.5,
+        cex.main = 1.1, cex.lab = 1.05)
+grid(col = "gray85", lty = "dotted")
+
+par(mfrow = c(1, 1))
+```
+
+L'analisi visiva delle serie storiche rivela le dinamiche che hanno caratterizzato il mercato energetico italiano nel periodo considerato. 
+
+La crisi energetica del 2022 emerge chiaramente nei grafici del PUN e del Gas: le tensioni geopolitiche internazionali hanno provocato un'impennata senza precedenti del prezzo del gas, trascinando con sé il prezzo dell'elettricità. Il PUN ha toccato punte superiori ai 700 \texteuro{}/MWh, livelli quasi dieci volte superiori alle medie storiche precedenti, con una volatilità estrema visibile nei continui salti dei prezzi.
+
+Dal 2023 si osserva un graduale rientro verso una nuova stabilità. La diversificazione degli approvvigionamenti di gas e una domanda più contenuta hanno favorito un calo drastico rispetto ai picchi della crisi, pur senza tornare ai livelli pre-2021. Le serie si sono assestate su una fascia di prezzo più elevata, ancora sensibile a eventuali shock di mercato.
+
+La serie dell'energia rinnovabile mostra un diverso andamento, scandito dai ritmi meteorologici. Le oscillazioni più ampie riflettono la stagionalità climatica, con maggiore produzione solare nei mesi estivi. Le fluttuazioni più ravvicinate derivano principalmente dalla variabilità delle condizioni meteo in giorni diversi che influenzano la disponibilità delle fonti rinnovabili.
+
+Infine, il movimento quasi sincronizzato delle prime due serie testimonia il legame strutturale tra gas ed elettricità: il gas rimane la fonte principale per garantire la continuità elettrica in Italia, e quando il suo costo aumenta, il prezzo dell'elettricità segue immediatamente, suggerendo una possibile relazione di cointegrazione.
+
+# Modelli Univariati SARIMA
+
+## Trasformazione Logaritmica
+
+Per stabilizzare la varianza e rendere le serie più adatte alla modellazione, applichiamo una trasformazione logaritmica a tutte le serie. Questa operazione mitiga l'impatto dei valori estremi registrati durante lo shock del 2022, rendendo la variabilità più omogenea nel tempo e le assunzioni dei modelli ARIMA più plausibili. Inoltre, consente di ragionare in termini di variazioni percentuali anziché assolute, interpretazione più significativa dal punto di vista economico.
+
+```{r log_transform}
+l_pun = log(pun_ts)
+l_gas = log(gas_ts)
+l_renew = log(renew_ts)
+```
+
+## Analisi della Stazionarietà
+
+Analizziamo le funzioni di autocorrelazione (ACF) e autocorrelazione parziale (PACF) dopo differenziazione ordinaria e stagionale per identificare la struttura ARIMA appropriata.
+
+```{r diff_analysis_pun, fig.width=12, fig.height=8, cache=TRUE}
+par(mfrow = c(2, 3))
+plot.ts(diff(l_pun), main = "Log-PUN: Diff 1", col = "darkblue", lwd = 1.2)
+acf(diff(l_pun), lag.max = 35, main = "ACF Diff 1", col = "steelblue", lwd = 2)
+pacf(diff(l_pun), lag.max = 35, main = "PACF Diff 1", col = "coral", lwd = 2)
+plot.ts(diff(l_pun, 7), main = "Log-PUN: Diff 7", col = "darkblue", lwd = 1.2)
+acf(diff(l_pun, 7), lag.max = 35, main = "ACF Diff 7", col = "steelblue", lwd = 2)
+pacf(diff(l_pun, 7), lag.max = 35, main = "PACF Diff 7", col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+```{r diff_analysis_gas, fig.width=12, fig.height=8, cache=TRUE}
+par(mfrow = c(2, 3))
+plot.ts(diff(l_gas), main = "Log-Gas: Diff 1", col = "darkred", lwd = 1.2)
+acf(diff(l_gas), lag.max = 35, main = "ACF Diff 1", col = "steelblue", lwd = 2)
+pacf(diff(l_gas), lag.max = 35, main = "PACF Diff 1", col = "coral", lwd = 2)
+plot.ts(diff(l_gas, 7), main = "Log-Gas: Diff 7", col = "darkred", lwd = 1.2)
+acf(diff(l_gas, 7), lag.max = 35, main = "ACF Diff 7", col = "steelblue", lwd = 2)
+pacf(diff(l_gas, 7), lag.max = 35, main = "PACF Diff 7", col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+```{r diff_analysis_renew, fig.width=12, fig.height=8, cache=TRUE}
+par(mfrow = c(2, 3))
+plot.ts(diff(l_renew), main = "Log-Renew: Diff 1", col = "darkgreen", lwd = 1.2)
+acf(diff(l_renew), lag.max = 35, main = "ACF Diff 1", col = "steelblue", lwd = 2)
+pacf(diff(l_renew), lag.max = 35, main = "PACF Diff 1", col = "coral", lwd = 2)
+plot.ts(diff(l_renew, 7), main = "Log-Renew: Diff 7", col = "darkgreen", lwd = 1.2)
+acf(diff(l_renew, 7), lag.max = 35, main = "ACF Diff 7", col = "steelblue", lwd = 2)
+pacf(diff(l_renew, 7), lag.max = 35, main = "PACF Diff 7", col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+L'analisi dei grafici ACF e PACF per le serie trasformate in logaritmi determina gli ordini di integrazione ordinaria ($d$) e stagionale ($D$) necessari per la stazionarietà.
+
+Per il **Prezzo dell'energia (PUN)**, la differenza ordinaria ($d=1$) elimina il trend di fondo centrando la serie sullo zero, ma l'ACF presenta picchi significativi e persistenti al lag 7 e suoi multipli, evidenza di stagionalità settimanale non risolta. La differenza stagionale a lag 7 riduce questa persistenza, suggerendo che la componente stagionale richieda parametri autoregressivi e di media mobile stagionali.
+
+Il **Prezzo del Gas** mostra dinamiche simili. La differenza prima è necessaria ma non sufficiente per stabilizzare la media della serie. La struttura stagionale settimanale, sebbene meno marcata rispetto al PUN, risulta comunque presente e richiede trattamento attraverso differenziazione stagionale.
+
+L'**Energia Rinnovabile** presenta caratteristiche diverse. La serie originale è dominata da un ciclo settimanale quasi deterministico, e l'applicazione della differenza stagionale ($D=1$) stabilizza visibilmente i dati. A differenza dei prezzi, la produzione rinnovabile non mostra un trend stocastico di lungo periodo ma oscilla attorno a livelli medi relativamente stabili una volta rimossa la componente settimanale, suggerendo $d=0$.
+
+## Stima dei Modelli SARIMA
+
+### Modello PUN
+
+Per il PUN stimiamo un modello SARIMA(0,1,2)(1,0,1)[7]:
+
+$$
+(1-\Phi_1 B^7)(1-B)\log(\text{PUN}_t) = (1+\theta_1 B + \theta_2 B^2)(1+\Theta_1 B^7)\varepsilon_t
+$$
+
+```{r sarima_pun, cache=TRUE}
+mod_pun = Arima(l_pun, order = c(0, 1, 2), seasonal = list(order = c(1, 0, 1), period = 7))
+summary(mod_pun)
+```
+
+```{r diagnostics_pun, fig.width=9, fig.height=4.5}
+plot.ts(mod_pun$residuals)
+acf_plot(mod_pun)
+ljung_box_plot(mod_pun$residuals, 24, fitdf = 3)
+```
+
+Il modello SARIMA(0,1,2)(1,0,1)[7] è stato selezionato come migliore specificazione secondo la procedura iterativa Box-Jenkins. Tuttavia, i test diagnostici sui residui (ACF, PACF e Ljung-Box) evidenziano persistenza di struttura non catturata. Il parametro della componente media mobile stagionale risulta vicino a 1 in valore assoluto, segnalando possibile instabilità numerica o una stagionalità settimanale particolarmente rigida.
+
+Le performance non ottimali derivano principalmente dalla forte eteroschedasticità residua e dagli shock esogeni del 2021-2022, che introducono variabilità difficilmente assorbibile da modelli lineari SARIMA. Nonostante questi limiti, il modello rappresenta una prima approssimazione utile del comportamento univariato della serie e fornisce una base per le analisi successive più sofisticate.
+
+### Modello Gas
+
+Per il Gas stimiamo un modello SARIMA(0,1,2)(0,1,1)[7]:
+
+$$
+(1-B)(1-B^7)\log(\text{Gas}_t) = (1+\theta_1 B + \theta_2 B^2)(1+\Theta_1 B^7)\varepsilon_t
+$$
+
+```{r sarima_gas, cache=TRUE}
+mod_gas = Arima(l_gas, order = c(0, 1, 2), seasonal = list(order = c(0, 1, 1), period = 7))
+summary(mod_gas)
+```
+
+```{r diagnostics_gas, fig.width=9, fig.height=4.5}
+plot.ts(mod_gas$residuals)
+acf_plot(mod_gas)
+ljung_box_plot(mod_gas$residuals, 24, fitdf = 3)
+```
+
+Anche il modello del Gas presenta diagnostiche non pienamente soddisfacenti, con residui che mostrano struttura autocorrelata residua. Il parametro della componente media mobile stagionale assume un valore prossimo a 1 in modulo, come nel modello SARIMA per PUN. L'estrema eteroschedasticità del periodo e i cambiamenti strutturali post-2022 limitano l'efficacia della modellazione lineare, ma, anche qui, il SARIMA(0,1,2)(0,1,1)[7] fornisce comunque la migliore approssimazione disponibile per questa fase preliminare.
+
+### Modello Rinnovabili
+
+Per le Rinnovabili stimiamo un modello SARIMA(1,0,0)(1,1,1)[7]:
+
+$$
+(1-\phi_1 B)(1-\Phi_1 B^7)(1-B^7)\log(\text{Renew}_t) = (1+\Theta_1 B^7)\varepsilon_t
+$$
+
+```{r sarima_renew, cache=TRUE}
+mod_renew = Arima(l_renew, order = c(1, 0, 0), seasonal = list(order = c(1, 1, 1), period = 7))
+summary(mod_renew)
+```
+
+```{r diagnostics_renew, fig.width=9, fig.height=4.5}
+plot.ts(mod_renew$residuals)
+acf_plot(mod_renew)
+ljung_box_plot(mod_renew$residuals, 28, fitdf = 4)
+```
+
+Il modello per le rinnovabili presenta il termine a media mobile stagionale prossimo a 1 in modulo, e autocorrelazione residua persistente. Il limite principale risiede probabilmente nella presenza di una stagionalità climatica annuale (inverno-estate) non catturabile con la frequenza settimanale adottata. Questa scelta di modellazione, pur impedendo di cogliere variazioni stagionali di lungo periodo, è funzionale all'analisi di breve termine e alla successiva integrazione con le altre serie. I residui eteroschedastici riflettono inoltre cambiamenti strutturali nel mix rinnovabile degli anni 2021-2025, confermando come i modelli lineari forniscano una base interpretativa utile ma non esaustiva della complessità dei dati reali.
+
+
+# Analisi di Cointegrazione
+
+L'analisi condotta finora ha evidenziato come le serie dei prezzi (PUN e Gas) condividano trend simili, suggerendo un legame di lungo periodo. In questa sezione estendiamo l'indagine per verificare se sia possibile includere anche la serie delle Rinnovabili in un'analisi di cointegrazione a tre variabili, o se la relazione di equilibrio sia limitata alla sola coppia dei prezzi.
+
+L'obiettivo è determinare se esista un equilibrio stabile che leghi il costo delle materie prime fossili e l'immissione di energia pulita alla formazione del prezzo elettrico nazionale. Il test di Johansen permetterà di identificare il rango di cointegrazione e di stabilire con rigore statistico se il sistema converga verso un equilibrio comune. Questo approccio multivariato supera i limiti dei modelli univariati, rivelando se l'incremento delle rinnovabili eserciti una pressione strutturale sui prezzi o se il legame Gas-PUN rimanga la dinamica dominante.
+
+## Preparazione dei Dati
+
+Costruiamo le matrici dei dati in livelli e in differenze prime per PUN e Gas.
+
+```{r coint_data_prep}
+data_levels = cbind(l_pun, l_gas)
+colnames(data_levels) = c("l_PUN", "l_Gas")
+
+data_diff = diff(data_levels)
+colnames(data_diff) = c("d_PUN", "d_Gas")
+```
+
+```{r diff_plots, fig.height=5}
+par(mfrow = c(2, 3))
+plot(data_diff[, 1], main = "Differenza Prima - Log PUN", ylab = "Delta", 
+     col = "darkblue", lwd = 1.2)
+acf(data_diff[, 1], lag.max = 60, main = "ACF - d(Log PUN)", 
+    col = "steelblue", lwd = 2)
+pacf(data_diff[, 1], lag.max = 60, main = "PACF - d(Log PUN)", 
+     col = "coral", lwd = 2)
+
+plot(data_diff[, 2], main = "Differenza Prima - Log Gas", ylab = "Delta", 
+     col = "darkred", lwd = 1.2)
+acf(data_diff[, 2], lag.max = 60, main = "ACF - d(Log Gas)", 
+    col = "steelblue", lwd = 2)
+pacf(data_diff[, 2], lag.max = 60, main = "PACF - d(Log Gas)", 
+     col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+L'analisi dei grafici conferma la stazionarietà delle serie differenziate, che oscillano attorno allo zero eliminando il trend. Tuttavia, i picchi ricorrenti nell'ACF al lag 7 segnalano una stagionalità settimanale ancora presente e strutturale. La volatilità sincrona nel 2022 suggerisce una risposta comune a shock esogeni, giustificando l'approccio multivariato per cercare un equilibrio di lungo periodo tra PUN e Gas.
+
+```{r diff_plot_renew, fig.height=2.5}
+data_diff_renew = diff(l_renew)
+
+par(mfrow = c(1, 3))
+plot(data_diff_renew, main = "Diff. Prima - Log Renew", ylab = "Delta", 
+     col = "darkgreen", lwd = 1.2)
+acf(data_diff_renew, lag.max = 60, main = "ACF - d(Log Renew)", 
+    col = "steelblue", lwd = 2)
+pacf(data_diff_renew, lag.max = 60, main = "PACF - d(Log Renew)", 
+     col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+La serie delle Rinnovabili presenta dinamiche radicalmente diverse dai prezzi energetici. A differenza di PUN e Gas, questa serie non mostra un trend stocastico di lungo periodo ma oscilla attorno a livelli fisicamente determinati. L'applicazione della differenza prima rischia di introdurre rumore superfluo, sovra-differenziando un processo intrinsecamente stazionario nei suoi livelli una volta depurato dalla stagionalità. Questa natura ciclica suggerisce un possibile rifiuto dell'ipotesi nulla di radice unitaria nei test ADF.
+
+## Test di Radice Unitaria (Augmented Dickey-Fuller)
+
+### Test ADF sul PUN
+
+Verifichiamo la presenza di radici unitarie nel logaritmo del PUN attraverso la sequenza di test ADF.
+
+```{r adf_pun_trend, cache=TRUE}
+test_pun_trend = ur.df(l_pun, type = "trend", lags = 7, selectlags = "BIC")
+summary(test_pun_trend)
+```
+
+Il test tau3 non rifiuta l'ipotesi nulla di radice unitaria. I test phi2 e phi3 suggeriscono l'assenza di trend deterministico.
+
+```{r adf_pun_drift}
+test_pun_drift = ur.df(l_pun, type = "drift", lags = 7, selectlags = "BIC")
+summary(test_pun_drift)
+```
+
+Anche con drift, il test tau2 non rifiuta la radice unitaria e suggerisce l'assenza di drift.
+
+```{r adf_pun_none}
+test_pun_none = ur.df(l_pun, type = "none", lags = 7, selectlags = "BIC")
+summary(test_pun_none)
+```
+
+```{r adf_pun_diff}
+summary(ur.df(diff(l_pun), type = "drift", lags = 7, selectlags = "BIC"))
+```
+
+Il test sulla serie differenziata rifiuta l'ipotesi di radice unitaria, confermando che il PUN è I(1) senza trend né drift.
+
+### Test ADF sul Gas
+
+Applichiamo la stessa procedura al logaritmo del prezzo del gas.
+
+```{r adf_gas_trend, cache=TRUE}
+test_gas_trend = ur.df(l_gas, type = "trend", lags = 7, selectlags = "BIC")
+summary(test_gas_trend)
+```
+
+```{r adf_gas_drift}
+test_gas_drift = ur.df(l_gas, type = "drift", lags = 7, selectlags = "BIC")
+summary(test_gas_drift)
+```
+
+```{r adf_gas_none}
+test_gas_none = ur.df(l_gas, type = "none", lags = 7, selectlags = "BIC")
+summary(test_gas_none)
+```
+
+```{r adf_gas_diff}
+summary(ur.df(diff(l_gas), type = "drift", lags = 7, selectlags = "BIC"))
+```
+
+Anche il Gas risulta essere I(1) senza trend né drift.
+
+### Test ADF su Renew
+
+Applichiamo la stessa procedura al logaritmo delle Rinnovabili.
+
+```{r adf_renew_trend, cache=TRUE}
+test_renew_trend = ur.df(l_renew, type = "trend", lags = 7, selectlags = "BIC")
+summary(test_renew_trend)
+```
+
+I test formali confermano l'assunzione di stazionarietà. Il test di radice unitaria porta a rifiutare l'ipotesi nulla: il logaritmo delle Rinnovabili risulta stazionario già nei livelli. Poiché la cointegrazione richiede che le variabili siano integrate dello stesso ordine, la natura I(0) delle rinnovabili ne impone l'esclusione dall'analisi di Johansen.
+
+## Test di Causalità di Granger
+
+Prima di procedere con l'analisi di cointegrazione, esploriamo la presenza di causalità di Granger tra le variabili differenziate.
+
+```{r granger_prep}
+lag_selection <- VARselect(data_diff, lag.max = 30)
+tabella_lag <- as.data.frame(t(lag_selection$selection))
+
+knitr::kable(
+  tabella_lag,
+  caption = "Selezione ottimale dei lag (Modello in differenze)",
+  booktabs = TRUE
+) %>%
+  kable_styling(latex_options = "hold_position")
+
+lag_granger <- 14
+```
+
+```{r granger_gas_to_pun}
+grangertest(data_diff[, "d_PUN"], data_diff[, "d_Gas"], order = lag_granger)
+```
+
+Il test verifica se il Gas causa secondo Granger il PUN.
+
+```{r granger_pun_to_gas}
+grangertest(data_diff[, "d_Gas"], data_diff[, "d_PUN"], order = lag_granger)
+```
+
+Il test verifica se il PUN causa secondo Granger il Gas.
+
+I risultati evidenziano una forte interdipendenza statistica tra i due mercati, con p-value estremamente significativi in entrambe le direzioni. Dal Gas al PUN si conferma la causalità attesa: il prezzo del gas agisce come driver fondamentale per il prezzo energetico, anticipando e spiegando i movimenti del PUN. La presenza di una causalità in direzione opposta segnala un possibile effetto di feedback. Sebbene l'intensità sia inferiore rispetto alla direzione primaria, sembra esistere una causalità bidirezionale: se il Gas guida i costi di generazione del PUN, quest'ultimo esercita un effetto di ritorno sul mercato del combustibile. Questa interconnessione rafforza l'ipotesi di un equilibrio di cointegrazione nel lungo periodo.
+
+## Test di Cointegrazione di Johansen
+
+Avendo verificato che entrambe le serie sono I(1), procediamo con il test di Johansen per identificare eventuali relazioni di cointegrazione. Sfruttiamo il BIC per la selezione dei lag ottimali.
+
+```{r johansen_prep}
+lag_select_levels = VARselect(data_levels, lag.max = 30, type = "both")
+knitr::kable(as.data.frame(t(lag_select_levels$selection)), 
+             caption = "Selezione ottimale dei lag per Test di Johansen (Livelli)",
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+K_johansen = lag_select_levels$selection["SC(n)"]
+```
+
+### Test della Traccia
+
+```{r johansen_trace, cache=TRUE}
+vecm_trace = ca.jo(data_levels, type = "trace", ecdet = "const", 
+                   K = K_johansen, spec = "longrun")
+summary(vecm_trace)
+```
+
+Il test della traccia rifiuta l'ipotesi $r=0$ ma non rifiuta $r \leq 1$, indicando la presenza di una relazione di cointegrazione.
+
+### Test del Massimo Autovalore
+
+```{r johansen_eigen, cache=TRUE}
+vecm_eigen = ca.jo(data_levels, type = "eigen", ecdet = "const", 
+                   K = K_johansen, spec = "longrun")
+summary(vecm_eigen)
+```
+
+Il test del massimo autovalore conferma la presenza di $r=1$ relazione di cointegrazione.
+
+## Diagnostica del VECM
+
+Verifichiamo la qualità dei residui del modello VECM.
+
+```{r vecm_diagnostics, fig.width=8, fig.height=8}
+par(mfrow = c(2, 2))
+plotres(vecm_trace)
+par(mfrow = c(1, 1))
+```
+
+I residui del modello VECM risultano generalmente soddisfacenti e coerenti con un processo white noise, indicando che il modello ha catturato correttamente la dinamica media del sistema. Tuttavia, l'analisi grafica evidenzia alcuni cluster di volatilità e fenomeni di eteroschedasticità, probabilmente legati ai picchi di prezzo occorsi durante la crisi energetica.
+
+## Stima del VECM e Vettori di Cointegrazione
+
+```{r vecm_estimation}
+vecm_rls = cajorls(vecm_trace, r = 1)
+```
+
+### Vettore di Cointegrazione
+
+```{r coint_vector}
+beta_tab <- as.data.frame(vecm_rls$beta)
+colnames(beta_tab) <- paste0("Beta_", seq_len(ncol(beta_tab)))
+
+knitr::kable(
+  beta_tab,
+  caption = "Matrice dei vettori di cointegrazione ($\\beta$)",
+  digits = 4,
+  booktabs = TRUE
+) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+La relazione di lungo periodo stimata è:
+
+$$
+\log(\text{PUN}_t) = 0.839 \cdot \log(\text{Gas}_t) + 1.677
+$$
+
+Il coefficiente 0.839 indica una trasmissione quasi totale dei costi: un incremento dell'1% nel prezzo del gas si traduce in un aumento dello 0.84% circa del PUN, confermando il ruolo del gas come driver principale. La costante (1.677) rappresenta la componente legata ai costi fissi, agli oneri di sistema e alla generazione da altre fonti non legate al gas. Il modello riflette la struttura del mercato energetico italiano, in cui il gas rappresenta la fonte di produzione più flessibile e costosa, le cui variazioni di prezzo tendono a guidare l'intero mercato elettrico.
+
+### Coefficienti di Aggiustamento (Alpha)
+
+```{r alpha_coefficients}
+alpha_matrix = vecm_rls$rlm$coefficients[grep("ect", rownames(vecm_rls$rlm$coefficients)), ]
+knitr::kable(alpha_matrix, caption = "Velocità di aggiustamento (Alpha)") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r alpha_significance}
+alpha_summary <- summary(vecm_rls$rlm)
+
+alpha_pun_pval <- alpha_summary$`Response l_PUN.d`$coefficients["ect1", "Pr(>|t|)"]
+alpha_gas_pval <- alpha_summary$`Response l_Gas.d`$coefficients["ect1", "Pr(>|t|)"]
+
+cat("Alpha PUN: p-value =", format(alpha_pun_pval, scientific = TRUE), "\n")
+cat("Alpha Gas: p-value =", format(alpha_gas_pval, scientific = TRUE), "\n")
+
+```
+
+I coefficienti alpha indicano la velocità di aggiustamento verso l'equilibrio di lungo periodo. $\alpha_{PUN}$ risulta negativo (-0.130) e altamente significativo, confermando che il PUN reagisce agli squilibri correggendo circa il 13% dello scostamento per periodo. Al contrario, $\alpha_{Gas}$ è praticamente nullo e statisticamente non significativo, indicando che il Gas non reagisce agli squilibri del sistema e agisce come variabile debolmente esogena che guida il meccanismo di formazione dei prezzi.
+
+## Procedura di Engle-Granger
+
+Per garantire la robustezza dei risultati ottenuti con la procedura di Johansen, procediamo a una verifica utilizzando gli stimatori Engle-Granger e DOLS (Dynamic Ordinary Least Squares). Questo confronto permette di controllare la coerenza delle stime attraverso approcci metodologici differenti.
+
+### Passo 1: Regressione OLS Statica
+
+La procedura di Engle-Granger inizia con una regressione OLS delle variabili in livelli per stimare la relazione di lungo periodo.
+
+```{r engle_granger_ols}
+ols_pun = lm(l_PUN ~ l_Gas, data = data_levels)
+summary(ols_pun)
+```
+
+Il coefficiente stimato è coerente con quello della procedura di Johansen.
+
+### Passo 2: Test di Stazionarietà sui Residui
+
+Per verificare la cointegrazione, testiamo la stazionarietà dei residui della regressione OLS.
+
+```{r eg_residuals_test}
+res_ols = ts(residuals(ols_pun), start = start(data_levels), 
+             frequency = frequency(data_levels))
+test_res_ols = ur.df(res_ols, type = "none", lags = 7, selectlags = "BIC")
+summary(test_res_ols)
+```
+
+Il test tau1 rifiuta l'ipotesi di radice unitaria nei residui, confermando che le serie sono cointegrate.
+
+```{r eg_residuals_plot, fig.width=8, fig.height=9}
+par(mfrow = c(3, 1))
+plot.ts(res_ols, main = "Residui OLS (Engle-Granger)", col = "darkblue", lwd = 1.2)
+abline(h = 0, col = "red", lty = 2, lwd = 2)
+grid(col = "gray90")
+acf(res_ols, lag.max = 60, main = "ACF Residui OLS", col = "steelblue", lwd = 2)
+pacf(res_ols, lag.max = 60, main = "PACF Residui OLS", col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+I residui confermano la stazionarietà della relazione oscillando attorno allo zero, ma i grafici evidenziano un'autocorrelazione persistente. Tale dinamica conferma che la sola regressione statica è insufficiente, giustificando l'impiego del modello ECM per catturare i corretti aggiustamenti di breve periodo.
+
+### Error Correction Model (ECM)
+
+Stimiamo un modello di correzione dell'errore utilizzando i residui della regressione OLS come termine di errore di cointegrazione.
+
+```{r ecm_ols}
+data_ecm = cbind(data_levels, ect_ols = res_ols)
+ecm_ols = dynlm(d(data_levels.l_PUN) ~ d(data_levels.l_Gas) + L(ect_ols), 
+                data = data_ecm)
+summary(ecm_ols)
+```
+
+Il coefficiente del termine ECT è negativo e significativo (-0.437), indicando che il sistema corregge circa il 44% dello squilibrio per periodo. Il coefficiente di $\Delta \log(Gas)$ cattura le relazioni di breve periodo, confermando una reattività immediata e quasi totale del PUN alle variazioni del prezzo del gas.
+
+## Dynamic OLS (DOLS)
+
+### Stima DOLS
+
+Il metodo Dynamic OLS corregge l'endogeneità dei regressori includendo lead e lag della variabile esplicativa differenziata. In base alla lunghezza della serie, il numero ottimale di lead/lag considerati è **`r ceiling((1/3)*(length(data_levels[,1]))^(1/3))`**.
+
+```{r dols_estimation, cache=TRUE}
+popt = ceiling((1/3)*(length(data_levels[, 1]))^(1/3))
+dols_pun = dynlm(l_PUN ~ l_Gas + L(d(l_Gas), -popt:popt), data = data_levels)
+summary(dols_pun)
+```
+
+Il modello DOLS conferma la robustezza della relazione di lungo periodo attraverso un'elasticità stimata dello 0.843, valore quasi identico allo 0.839 ottenuto con la procedura di Johansen. L'elevata significatività statistica del parametro e un R-squared del 94.4% indicano un legame estremamente solido, validando definitivamente la coerenza del vettore di cointegrazione individuato.
+
+### Test sui Residui DOLS
+
+```{r dols_residuals_test}
+res_dols = ts(residuals(dols_pun), start = start(data_levels), 
+              frequency = frequency(data_levels))
+test_res_dols = ur.df(res_dols, lags = 7, type = "none", selectlags = "BIC")
+summary(test_res_dols)
+```
+
+La stazionarietà dei residui conferma che il legame individuato non è una regressione spuria ma un equilibrio di lungo periodo.
+
+```{r dols_residuals_plot, fig.width=8, fig.height=9}
+par(mfrow = c(3, 1))
+plot.ts(res_dols, main = "Residui DOLS", col = "darkblue", lwd = 1.2)
+abline(h = 0, col = "red", lty = 2, lwd = 2)
+grid(col = "gray90")
+acf(res_dols, lag.max = 60, main = "ACF Residui DOLS", col = "steelblue", lwd = 2)
+pacf(res_dols, lag.max = 60, main = "PACF Residui DOLS", col = "coral", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+Tuttavia, come nel caso dell'ECM basato su Engle-Granger, i residui mostrano autocorrelazione persistente e non possono essere considerati white noise.
+
+### ECM con Residui DOLS
+
+```{r ecm_dols}
+data_ecm_dols = cbind(data_levels, ect_dols = res_dols)
+ecm_dols = dynlm(d(data_levels.l_PUN) ~ d(data_levels.l_Gas) + L(ect_dols), 
+                 data = data_ecm_dols)
+summary(ecm_dols)
+```
+
+L'ECM basato su DOLS mostra che il PUN reagisce con estrema rapidità alle variazioni del gas nel brevissimo periodo (0.875). Tuttavia, la velocità di correzione dello squilibrio è più contenuta (7.1%), indicando che il sistema impiega più tempo per tornare stabilmente verso la sua relazione di equilibrio di lungo periodo.
+
+Il confronto tra i tre modelli conferma la solidità della relazione di lungo periodo, con un'elasticità del PUN rispetto al Gas costantemente compresa tra 0.82 e 0.87. Emergono tuttavia differenze nette nella dinamica di aggiustamento: il modello Engle-Granger tende a sovrastimare la velocità di correzione (44%), mentre DOLS e VECM suggeriscono un rientro all'equilibrio più lento (rispettivamente 7% e 13%). Il DOLS, in quanto stimatore più efficiente in presenza di endogeneità, fornisce stime più affidabili della relazione di lungo periodo, convergendo quasi perfettamente con il VECM. Quest'ultimo si distingue come l'approccio statisticamente più robusto: i suoi residui mostrano un comportamento superiore, avvicinandosi alle proprietà di un processo white noise e superando nettamente le autocorrelazioni persistenti presenti negli ECM basati su Engle-Granger e DOLS. Si nota infine come la direzione della relazione modellata dal VECM sia unidirezionale da Gas a PUN, in contrasto con quanto emerso dai test sulla cusalità secondo Granger.
+
+# Transfer Function Models
+
+L'analisi di cointegrazione ha evidenziato come il prezzo del gas sia debolmente esogeno rispetto al PUN, suggerendo una relazione dinamica prevalentemente unidirezionale. Questo risultato motiva l'adozione di modelli a funzione di trasferimento (TFM), che consentono di isolare e quantificare l'impatto dinamico di una variabile esplicativa su una variabile risposta attraverso una struttura parsimoniosa.
+
+Poiché l'analisi precedente si è concentrata sulla relazione Gas-PUN, e non è emersa alcuna relazione di lungo periodo tra PUN e Rinnovabili, si ritiene opportuno stimare un ulteriore TFM anche per questa coppia di variabili. L'obiettivo è indagare se, pur in assenza di cointegrazione, esistano dinamiche di breve periodo significative attraverso cui le Rinnovabili influenzino il prezzo dell'energia elettrica.
+
+## Pre-Whitening e Cross-Correlazione
+
+Prima di procedere con la stima dei modelli di funzione di trasferimento, è necessario destagionalizzare le serie per eliminare le componenti deterministiche che potrebbero distorcere l'identificazione della struttura dinamica. Utilizziamo i modelli SARIMA stimati in precedenza per ottenere serie pre-whitened, dalle quali la stagionalità settimanale è stata rimossa, pur tenendo a mente i limiti precedentemente discussi.
+
+```{r deseasonalize}
+mod_pun_ds = Arima(l_pun, order = c(0, 1, 0), 
+                   seasonal = list(order = c(1, 0, 1), period = 7))
+l_pun_ds = mod_pun_ds$residuals
+
+mod_gas_ds = Arima(l_gas, order = c(0, 1, 0), 
+                   seasonal = list(order = c(0, 1, 1), period = 7))
+l_gas_ds = mod_gas_ds$residuals
+
+mod_renew_ds = Arima(l_renew, order = c(0, 0, 0), 
+                     seasonal = list(order = c(1, 1, 1), period = 7))
+l_renew_ds = mod_renew_ds$residuals
+```
+
+L'analisi delle funzioni di cross-correlazione (CCF) sulle serie destagionalizzate permette di identificare la presenza e la struttura temporale delle relazioni dinamiche tra le variabili.
+
+```{r ccf_deseasonalized, fig.width=10, fig.height=9}
+par(mfrow = c(3, 1))
+ccf(l_pun_ds, l_gas_ds, main = "CCF: PUN e Gas (Destagionalizzate)", 
+    col = "steelblue", lwd = 2, ylab = "Cross-correlazione")
+grid(col = "gray85", lty = "dotted")
+
+ccf(l_pun_ds, l_renew_ds, main = "CCF: PUN e Rinnovabili (Destagionalizzate)", 
+    col = "darkgreen", lwd = 2, ylab = "Cross-correlazione")
+grid(col = "gray85", lty = "dotted")
+
+ccf(l_gas_ds, l_renew_ds, main = "CCF: Gas e Rinnovabili (Destagionalizzate)", 
+    col = "coral", lwd = 2, ylab = "Cross-correlazione")
+grid(col = "gray85", lty = "dotted")
+par(mfrow = c(1, 1))
+```
+
+La cross-correlazione tra PUN e Gas mostra un picco netto al lag zero, confermando l'impatto immediato e dominante del costo del gas sul prezzo elettrico. La relazione PUN-Rinnovabili presenta invece una struttura più articolata, con correlazioni significative distribuite su più lag, indicando una possibile risposta ritardata del sistema. Si nota inoltre la somiglianza tra le CCF di PUN-Rinnovabili e Gas-Rinnovabili; in questa relazione l'obiettivo principale è la modellazione di PUN, pertanto si ignorerà questa ultima coppia di variabili.
+
+## Transfer Function Model: Gas $\rightarrow$ PUN
+
+### Identificazione della Struttura
+
+Il primo passo consiste nell'identificare la struttura ARMA della serie input (Gas) e nel calcolare i residui pre-whitened per entrambe le serie. Dopo destagionalizzazione e differenziazione, il modello del Gas si riduce a un processo ARMA(0,2).
+
+```{r tfm_gas_prep}
+mod_gas_arma = Arima(l_gas_ds, order = c(0, 0, 2))
+alfa_gas = mod_gas_arma$residuals
+mod_pun_w = Arima(l_pun_ds, order = c(0, 0, 2), 
+                  fixed = c(mod_gas_arma$coef[1], mod_gas_arma$coef[2], 
+                           mod_gas_arma$coef[3]))  
+beta_gas = mod_pun_w$residuals
+```
+
+```{r tfm_gas_ccf, fig.width=8, fig.height=4.5}
+ccf(beta_gas, alfa_gas, lag.max = 20, 
+    main = "CCF: Residui Pre-whitened (PUN e Gas)",
+    col = "steelblue", lwd = 2, ylab = "Cross-correlazione")
+grid(col = "gray85", lty = "dotted")
+```
+
+L'analisi della cross-correlazione dei residui pre-whitened permette di identificare i parametri della funzione di trasferimento secondo la notazione standard: $b$ (ritardo iniziale), $r$ (ordine del denominatore), $s$ (ordine del numeratore). Dal grafico si identificano $b=0$, $r=0$, $s=1$, indicando una risposta immediata del PUN con persistenza limitata a un periodo.
+
+### Stima del Modello
+
+```{r tfm_gas_estimate, warning=FALSE, message=FALSE, cache=TRUE}
+tfm_gas = MTS::tfm1(l_pun_ds, l_gas_ds, orderN = c(0, 0, 2), 
+                    orderX = c(0, 1, 0))
+```
+
+```{r tfm_gas_coef}
+coef_gas = tfm_gas$estimate
+se_gas = sqrt(diag(tfm_gas$varcoef))
+t_stat_gas = coef_gas / se_gas
+p_value_gas = 2 * (1 - pnorm(abs(t_stat_gas)))
+
+results_gas = data.frame(
+  Parametro = names(coef_gas),
+  Stima = coef_gas,
+  Std_Error = se_gas,
+  t_stat = t_stat_gas,
+  p_value = p_value_gas,
+  row.names = NULL
+)
+knitr::kable(results_gas, digits = 4, 
+             caption = "Coefficienti stimati - TFM Gas $\\rightarrow$ PUN",
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+Il modello evidenzia una relazione dinamica altamente significativa tra il prezzo del Gas e il PUN. Un incremento dell'1% nel prezzo del gas si traduce in un aumento contemporaneo del 0.54% del PUN, seguito da un effetto aggiuntivo di 0.24% nel periodo successivo. La componente stocastica del PUN è descritta da un processo MA(2), coerente con la persistenza di breve periodo già osservata nei modelli univariati.
+
+### Diagnostica dei Residui
+
+```{r tfm_gas_diagnostics, fig.width=10, fig.height=9}
+par(mfrow = c(3, 1))
+ccf(tfm_gas$residuals, alfa_gas[2:length(alfa_gas)], lag.max = 20,
+    main = "CCF: Residui TFM e Input Pre-whitened",
+    col = "steelblue", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+
+acf(tfm_gas$residuals, lag.max = 35, main = "ACF Residui TFM Gas$\rightarrow$PUN", 
+    col = "steelblue", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+
+pacf(tfm_gas$residuals, lag.max = 35, main = "PACF Residui TFM Gas$\rightarrow$PUN", 
+     col = "coral", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+par(mfrow = c(1, 1))
+```
+
+```{r tfm_gas_ljungbox, fig.width=8, fig.height=4.5}
+ljung_box_plot(tfm_gas$residuals, max_lag = 24, fitdf = length(coef_gas))
+```
+
+I residui del modello mostrano proprietà generalmente coerenti con un processo White Noise. La CCF tra residui e input pre-whitened non presenta autocorrelazioni significative, confermando che la struttura dinamica è stata catturata adeguatamente. L'ACF e la PACF dei residui mostrano valori contenuti entro le bande di confidenza, con eventuali superamenti di ampiezza trascurabile. Nonostante ciò, il test di Ljung-Box segnala la presenza di autocorrelazione residua significativa.
+
+## Transfer Function Model: Rinnovabili $\rightarrow$ PUN
+
+### Identificazione della Struttura
+
+Analogamente, procediamo con l'identificazione del modello per l'impatto delle rinnovabili sul PUN. Il modello delle rinnovabili destagionalizzato si riduce a un processo AR(1).
+
+```{r tfm_renew_prep}
+mod_renew_arma = Arima(l_renew_ds, order = c(1, 0, 0))
+alfa_renew = mod_renew_arma$residuals
+mod_pun_w2 = Arima(l_pun_ds, order = c(1, 0, 0), 
+                   fixed = mod_renew_arma$coef)  
+beta_renew = mod_pun_w2$residuals
+```
+
+```{r tfm_renew_ccf, fig.width=8, fig.height=4.5}
+ccf(beta_renew, alfa_renew, lag.max = 20,
+    main = "CCF: Residui Pre-whitened (PUN e Rinnovabili)",
+    col = "darkgreen", lwd = 2, ylab = "Cross-correlazione")
+grid(col = "gray85", lty = "dotted")
+```
+
+La struttura identificata rimane $b=0$, $r=0$, $s=1$, coerente con il modello precedente.
+
+### Stima del Modello
+
+```{r tfm_renew_estimate, warning=FALSE, message=FALSE, cache=TRUE}
+tfm_renew = MTS::tfm1(l_pun_ds, l_renew_ds, orderN = c(0, 0, 2), 
+                      orderX = c(0, 1, 0))
+```
+
+```{r tfm_renew_coef}
+coef_renew = tfm_renew$estimate
+se_renew = sqrt(diag(tfm_renew$varcoef))
+t_stat_renew = coef_renew / se_renew
+p_value_renew = 2 * (1 - pnorm(abs(t_stat_renew)))
+
+results_renew = data.frame(
+  Parametro = names(coef_renew),
+  Stima = coef_renew,
+  Std_Error = se_renew,
+  t_stat = t_stat_renew,
+  p_value = p_value_renew,
+  row.names = NULL
+)
+knitr::kable(results_renew, digits = 4, 
+             caption = "Coefficienti stimati - TFM Rinnovabili $\\rightarrow$ PUN",
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+Il modello evidenzia una relazione dinamica statisticamente significativa, ma con una struttura controintuitiva rispetto alle attese economiche. Un incremento dell'1% nella quantità di rinnovabili si traduce in un aumento contemporaneo del 0.48% del PUN, seguito da un effetto negativo di 0.42% nel periodo successivo.
+
+Questo risultato appare in contrasto con la teoria economica standard, secondo cui un aumento di produzione da fonti rinnovabili (caratterizzate da costi variabili quasi nulli) dovrebbe esercitare una pressione al ribasso sul prezzo di mercato. Una possibile spiegazione risiede in una dinamica di compensazione del sistema elettrico. L'effetto negativo ritardato potrebbe poi riflettere il consolidamento dell'abbassamento dei prezzi una volta assorbito lo shock iniziale. Tuttavia, questa interpretazione richiede ulteriori verifiche attraverso analisi più sofisticate e dati ad alta frequenza sulla struttura del dispacciamento elettrico.
+
+### Diagnostica dei Residui
+
+```{r tfm_renew_diagnostics, fig.width=10, fig.height=9}
+par(mfrow = c(3, 1))
+ccf(tfm_renew$residuals, alfa_renew[2:length(alfa_renew)], lag.max = 20,
+    main = "CCF: Residui TFM e Input Pre-whitened",
+    col = "darkgreen", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+
+acf(tfm_renew$residuals, lag.max = 35, main = "ACF Residui TFM Renew$\rightarrow$PUN", 
+    col = "steelblue", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+
+pacf(tfm_renew$residuals, lag.max = 35, main = "PACF Residui TFM Renew$\rightarrow$PUN", 
+     col = "coral", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+par(mfrow = c(1, 1))
+```
+
+```{r tfm_renew_ljungbox, fig.width=8, fig.height=4.5}
+ljung_box_plot(tfm_renew$residuals, max_lag = 24, fitdf = length(coef_renew))
+```
+
+I residui mostrano comportamento sostanzialmente coerente con un processo white noise, confermando che il modello ha catturato adeguatamente la struttura dinamica della relazione. La CCF con l'input pre-whitened non presenta autocorrelazioni significative, mentre ACF e PACF rimangono entro le bande di confidenza. Di nuovo, però, il test di Ljung-Box sostanzialmente rifiuta l'ipotesi nulla di assenza di autocorrelazione.
+
+Entrambi i modelli confermano relazioni causali unidirezionali, in cui i valori presenti e passati delle variabili esplicative influenzano il valore attuale del PUN, senza evidenza di feedback inverso nel breve periodo. Questo risultato è coerente con la struttura del mercato elettrico italiano, dove il PUN si forma come variabile endogena in risposta ai costi di generazione (Gas) e alla disponibilità di fonti a costo marginale nullo (Rinnovabili).
+
+# Modelli VAR
+
+In questa sezione estendiamo l'analisi multivariata utilizzando modelli Autoregressivi Vettoriali (VAR) sulle serie destagionalizzate. I modelli VAR permettono di catturare le interdipendenze dinamiche tra le tre variabili del sistema (prezzi del gas, prezzi dell'energia elettrica e produzione da rinnovabili) senza imporre a priori una struttura causale.
+
+Per svolgere successivamente le analisi IRF e FEVD è necessario ordinare le variabili. L'ordinamento scelto riflette la struttura economica del sistema: il prezzo del Gas è considerato la variabile più esogena, determinata da mercati internazionali e non influenzata nel breve periodo dal mercato elettrico nazionale. La produzione da rinnovabili, dipendente principalmente da fattori meteo e di capacità installata, non reagisce istantaneamente ai prezzi dell'energia ma può essere influenzata dal prezzo del Gas per quanto riguarda la quantità effettivamente immessa nel mercato. Il prezzo dell'energia risulta la variabile più endogena, reagendo immediatamente a shock su Gas e Rinnovabili.
+
+## Preparazione dei Dati
+
+Per il gas e il PUN, non stazionarie, applichiamo la differenza prima, mentre per le rinnovabili utilizziamo direttamente il logaritmo.
+
+```{r var_data_prep}
+# Trasformazioni
+l_gas_diff <- diff(log(gas_ts))
+l_pun_diff <- diff(log(pun_ts))
+l_renew <- log(renew_ts)
+
+# Allineamento serie (diff rimuove la prima osservazione)
+l_renew_aligned <- window(l_renew, start = start(l_gas_diff))
+
+# Dataset per il VAR
+df_var <- ts.union(l_gas_diff, l_renew_aligned, l_pun_diff)
+colnames(df_var) <- c("gas", "renew", "pun")
+```
+
+Prima di procedere con la destagionalizzazione, esaminiamo le proprietà delle serie grezze.
+
+```{r var_raw_series, fig.width=12, fig.height=12, cache=TRUE}
+par(mfrow = c(3, 3))
+for(i in 1:NCOL(df_var)){
+  plot.ts(df_var[,i], main = paste("Serie:", colnames(df_var)[i]), 
+          ylab = "Valore", col = c("darkred", "darkgreen", "darkblue")[i], lwd = 1.2)
+  grid(col = "gray85", lty = "dotted")
+  acf(df_var[,i], lag.max = 21, main = paste("ACF:", colnames(df_var)[i]), 
+      col = "steelblue", lwd = 2)
+  pacf(df_var[,i], lag.max = 21, main = paste("PACF:", colnames(df_var)[i]), 
+       col = "coral", lwd = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+Coerentemente con le analisi precedenti, le serie presentano una evidente componente stagionale con frequenza settimanale.
+
+## Destagionalizzazione con STL
+
+Per rimuovere la componente stagionale dalle serie, utilizziamo la decomposizione STL (Seasonal and Trend decomposition using Loess) con finestra stagionale periodica.
+
+```{r var_deseason}
+gas_ds <- seasadj(stl(df_var[, "gas"], s.window = "periodic"))
+renew_ds <- seasadj(stl(df_var[, "renew"], s.window = "periodic"))
+pun_ds <- seasadj(stl(df_var[, "pun"], s.window = "periodic"))
+
+# Ricrea dataset con serie destagionalizzate
+df_var <- ts.union(gas_ds, renew_ds, pun_ds)
+colnames(df_var) <- c("gas", "renew", "pun")
+```
+
+```{r var_deseason_plot, fig.width=12, fig.height=12, cache=TRUE}
+par(mfrow = c(3, 3))
+for(i in 1:NCOL(df_var)){
+  plot.ts(df_var[,i], main = paste("Serie:", colnames(df_var)[i]), 
+          ylab = "Valore", col = c("darkred", "darkgreen", "darkblue")[i], lwd = 1.2)
+  grid(col = "gray85", lty = "dotted")
+  acf(df_var[,i], lag.max = 21, main = paste("ACF:", colnames(df_var)[i]), 
+      col = "steelblue", lwd = 2)
+  pacf(df_var[,i], lag.max = 21, main = paste("PACF:", colnames(df_var)[i]), 
+       col = "coral", lwd = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+La rimozione della stagionalità ha effetti evidenti: le serie mostrano ora chiaramente le rispettive dinamiche autoregressive (AR) e di media mobile (MA), depurate dalle oscillazioni settimanali che dominavano i grafici precedenti.
+
+## Analisi delle Cross-Correlazioni
+
+Le funzioni di cross-correlazione (CCF) identificano potenziali relazioni di lead-lag tra le variabili, fornendo indicazioni preliminari sulle direzioni causali.
+
+```{r var_ccf, fig.width=8, fig.height=9}
+ccf(df_var[, "gas"], df_var[, "renew"], lag.max = 21, 
+    main = "CCF: Gas & Rinnovabili", col = "steelblue", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+ccf(df_var[, "gas"], df_var[, "pun"], lag.max = 21, 
+    main = "CCF: Gas & PUN", col = "steelblue", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+ccf(df_var[, "pun"], df_var[, "renew"], lag.max = 21, 
+    main = "CCF: PUN & Rinnovabili", col = "steelblue", lwd = 2)
+grid(col = "gray85", lty = "dotted")
+```
+
+Tutte le coppie di variabili mostrano una correlazione contemporanea significativa. Il PUN risulta influenzato sia dal prezzo del Gas (relazione prevalentemente unilaterale) sia dalle Rinnovabili. Si osserva inoltre un'influenza unidirezionale dalle Rinnovabili al Gas. 
+
+## Selezione dell'Ordine di Ritardo
+
+Utilizziamo criteri di informazione multipli (AIC, HQ, SC/BIC, FPE) per determinare il numero ottimale di ritardi da includere nel modello VAR.
+
+```{r var_lag_selection}
+IC_selection <- VARselect(df_var, lag.max = 21, type = "const")
+print(IC_selection$selection)
+```
+
+I criteri informativi suggeriscono ordini differenti. Si adotta la specificazione più parsimoniosa indicata dal BIC, ma data la presenza di una marcata stagionalità settimanale, si procede alla stima, oltre che del modello VAR(3), anche dei modelli VAR(7) e VAR(14).
+
+## Stima dei Modelli VAR
+
+Per ciascun ordine di ritardo, si stimano modelli VAR completi e ridotti. Il modello ridotto applica restrizioni sui coefficienti non significativi mediante il metodo della significatività sequenziale (SER). Il test del rapporto di verosimiglianza determina quale specificazione sia preferibile.
+
+### VAR(3)
+
+```{r var3}
+mod_var3 <- vars::VAR(df_var, p = 3, type = "const")
+mod_var3_res <- restrict(mod_var3, method = "ser", thresh = 1.96)
+```
+
+```{r var3_lrtest}
+lrtest(mod_var3, mod_var3_res)
+summary(mod_var3_res)
+```
+
+### VAR(7)
+
+```{r var7}
+mod_var7 <- vars::VAR(df_var, p = 7, type = "const")
+mod_var7_res <- restrict(mod_var7, method = "ser", thresh = 1.96)
+```
+
+```{r var7_lrtest}
+lrtest(mod_var7, mod_var7_res)
+summary(mod_var7_res)
+```
+
+### VAR(14)
+
+```{r var14}
+mod_var14 <- vars::VAR(df_var, p = 14, type = "const")
+mod_var14_res <- restrict(mod_var14, method = "ser", thresh = 1.96)
+```
+
+```{r var14_lrtest}
+lrtest(mod_var14, mod_var14_res)
+summary(mod_var14_res)
+```
+
+In tutti e tre i modelli il test del rapporto di verosimiglianza non consente di rifiutare l’ipotesi nulla, indicando che le restrizioni imposte non comportano una perdita significativa di informazione rispetto al modello non ristretto. 
+
+Emerge una marcata componente autoregressiva del Gas in tutte le specificazioni considerate, influenzato anche da alcuni ritardi delle Rinnovabili. Le Rinnovabili nel VAR(3) appaiono sostanzialmente autoregressive, mentre nei VAR(7) e VAR(14) emergono effetti significativi di Gas e PUN rispettivamente a lag medi e medio-lunghi. Il PUN si conferma come la variabile più endogena del sistema, risultando significativamente influenzato da tutte le variabili considerate.
+
+## Confronto dei Modelli tramite BIC
+
+```{r var_bic_comparison}
+bic_values <- c(
+  VAR3 = BIC(mod_var3_res)[1],
+  VAR7 = BIC(mod_var7_res)[1],
+  VAR14 = BIC(mod_var14_res)[1]
+)
+print(sort(bic_values, decreasing = FALSE))
+```
+
+Il BIC seleziona il modello con ordine 7, confermando la presenza di un pattern settimanale.
+
+## Diagnostica dei Residui
+
+### Analisi Grafica
+
+Esaminiamo graficamente i residui dei tre modelli per valutare l'adeguatezza della specificazione.
+
+```{r var_residuals_setup, echo=FALSE}
+var_models <- list(mod_var3_res, mod_var7_res, mod_var14_res)
+var_names <- c("VAR(3)", "VAR(7)", "VAR(14)")
+res_var_list <- lapply(var_models, residuals)
+```
+
+```{r var_residuals_plots, fig.width=10, fig.height=12, cache=TRUE}
+for(i in 1:3){
+  par(mfrow = c(1, 1))
+  plot.ts(res_var_list[[i]], main = paste("Residui", var_names[i]),
+          col = c("darkred", "darkgreen", "darkblue"))
+  grid(col = "gray85", lty = "dotted")
+ 
+  par(mfrow = c(3, 2))
+  for(j in 1:3){
+    acf(res_var_list[[i]][, j], lag.max = 21,
+        main = paste("ACF", colnames(res_var_list[[i]])[j], "-", var_names[i]),
+        col = "steelblue", lwd = 2)
+    pacf(res_var_list[[i]][, j], lag.max = 21,
+         main = paste("PACF", colnames(res_var_list[[i]])[j], "-", var_names[i]),
+         col = "coral", lwd = 2)
+  }
+  par(mfrow = c(1, 1))
+}
+```
+
+In tutti i modelli, i residui sono centrati attorno a zero, ma mostrano evidenze di eteroschedasticità. I residui del VAR(3) non si comportano come White Noise, con diversi coefficienti ancora significativi nelle funzioni ACF e PACF. Al contrario, i residui dei modelli VAR(7) e VAR(14) risultano più coerenti con le ipotesi di White Noise, senza differenze marcate tra le due specificazioni.
+
+### Cross-Correlazione dei Residui
+
+Verifichiamo l'indipendenza tra i residui delle diverse equazioni.
+
+```{r var_residuals_ccf, fig.width=8, fig.height=9, cache=TRUE}
+for(i in 1:3){
+  par(mfrow = c(3, 1))
+  ccf(res_var_list[[i]][, "gas"], res_var_list[[i]][, "renew"],
+      lag.max = 21, main = paste("Residui: Gas & Rinnovabili -", var_names[i]),
+      col = "steelblue", lwd = 2)
+  grid(col = "gray85", lty = "dotted")
+  ccf(res_var_list[[i]][, "gas"], res_var_list[[i]][, "pun"],
+      lag.max = 21, main = paste("Residui: Gas & PUN -", var_names[i]),
+      col = "steelblue", lwd = 2)
+  grid(col = "gray85", lty = "dotted")
+  ccf(res_var_list[[i]][, "pun"], res_var_list[[i]][, "renew"],
+      lag.max = 21, main = paste("Residui: PUN & Rinnovabili -", var_names[i]),
+      col = "steelblue", lwd = 2)
+  grid(col = "gray85", lty = "dotted")
+  par(mfrow = c(1, 1))
+}
+```
+
+Nel VAR(3) i residui non risultano completamente incorrelati, come indicano alcuni coefficienti significativi nelle funzioni di cross-correlazione. Al contrario, i residui dei modelli VAR(7) e VAR(14) appaiono sostanzialmente incorrelati.
+
+### Correlazione Contemporanea
+
+```{r var_residuals_correlation}
+for(i in 1:3){
+  cat("\n", var_names[i], ":\n")
+  print(round(cor(res_var_list[[i]]), 3))
+}
+```
+
+Le tre matrici di correlazione dei residui sono molto simili tra loro, con valori di correlazione tra le variabili relativamente contenuti.
+
+## Test Diagnostici
+
+### Test Univariati di Ljung-Box
+
+Verifichiamo l'assenza di autocorrelazione seriale nei residui di ciascuna equazione, sia sui residui che sui residui al quadrato (per testare eteroschedasticità).
+
+```{r var_ljung_box}
+for(i in 1:3){
+  cat("\n", var_names[i], ":\n")
+  pval <- matrix(NA, 2, 3)
+  colnames(pval) <- colnames(res_var_list[[i]])
+  rownames(pval) <- c("Ljung-Box r", "Ljung-Box r^2")
+ 
+  for(j in 1:NCOL(res_var_list[[i]])){
+    pval[1, j] <- Box.test(res_var_list[[i]][, j], lag = 21, type = "Lj")$p.value
+    pval[2, j] <- Box.test(res_var_list[[i]][, j]^2, lag = 21, type = "Lj")$p.value
+  }
+  print(round(pval, 4))
+}
+```
+
+```{r var_ljung_box_plots, fig.width=10, fig.height=12, cache=TRUE}
+for(i in 1:3){
+  par(mfrow = c(3, 2))
+  for(j in 1:3){
+    pvals_r <- sapply(1:21, function(l) 
+      Box.test(res_var_list[[i]][, j], lag = l, type = "Ljung-Box")$p.value)
+    plot(pvals_r, type = "b", ylim = c(0, 1), ylab = "p-value", 
+         xlab = "Lag", main = paste("Ljung-Box:", colnames(res_var_list[[i]])[j], 
+                                     "-", var_names[i]), 
+         pch = 19, col = "steelblue", lwd = 2)
+    abline(h = 0.05, col = "red", lty = 2, lwd = 2)
+    grid(col = "gray85", lty = "dotted")
+    
+    pvals_r2 <- sapply(1:21, function(l) 
+      Box.test(res_var_list[[i]][, j]^2, lag = l, type = "Ljung-Box")$p.value)
+    plot(pvals_r2, type = "b", ylim = c(0, 1), ylab = "p-value", 
+         xlab = "Lag", main = paste("Ljung-Box r²:", colnames(res_var_list[[i]])[j], 
+                                     "-", var_names[i]), 
+         pch = 19, col = "coral", lwd = 2)
+    abline(h = 0.05, col = "red", lty = 2, lwd = 2)
+    grid(col = "gray85", lty = "dotted")
+  }
+  par(mfrow = c(1, 1))
+}
+```
+
+Il test di Ljung-Box sui residui conferma come il VAR(3) non colga tutta la struttura delle variabili, con residui che presentano autocorrelazione seriale. Anche il VAR(7) presenta autocorrelazione seriale residua per Gas e PUN, mentre il VAR(14) riesce a cogliere interamente la struttura di autocorrelazione delle serie. Il test sui residui al quadrato conferma la presenza di eteroschedasticità in tutti i modelli, come osservato precedentemente nell'analisi grafica.
+
+### Test di Stabilità
+
+Verifichiamo che le radici del polinomio caratteristico siano inferiori a uno, condizione necessaria per la stazionarietà del processo VAR.
+
+```{r var_stability}
+cat("VAR(3):\n"); print(roots(mod_var3_res))
+cat("\nVAR(7):\n"); print(roots(mod_var7_res))
+cat("\nVAR(14):\n"); print(roots(mod_var14_res))
+```
+
+Tutte le radici sono minori di 1, confermando la stabilità dei tre modelli stimati.
+
+### Test di Normalità Multivariata
+
+```{r var_normality}
+cat("VAR(3):\n"); print(normality.test(mod_var3_res))
+cat("\nVAR(7):\n"); print(normality.test(mod_var7_res))
+cat("\nVAR(14):\n"); print(normality.test(mod_var14_res))
+```
+
+Tutti i test rifiutano le ipotesi di normalità dei residui.
+
+### Test di Autocorrelazione Seriale
+
+#### Test Portmanteau
+
+```{r var_portmanteau}
+cat("VAR(3):\n"); print(serial.test(mod_var3_res, lags.pt = 21, type = "PT.asymptotic"))
+cat("\nVAR(7):\n"); print(serial.test(mod_var7_res, lags.pt = 21, type = "PT.asymptotic"))
+cat("\nVAR(14):\n"); print(serial.test(mod_var14_res, lags.pt = 21, type = "PT.asymptotic"))
+```
+
+#### Test Breusch-Godfrey
+
+```{r var_breusch_godfrey}
+cat("VAR(3):\n"); print(serial.test(mod_var3_res, lags.bg = 21, type = "BG"))
+cat("\nVAR(7):\n"); print(serial.test(mod_var7_res, lags.bg = 21, type = "BG"))
+cat("\nVAR(14):\n"); print(serial.test(mod_var14_res, lags.bg = 21, type = "BG"))
+```
+
+I due test concordano nell'indicare autocorrelazione residua nei VAR(3) e VAR(7), mentre il test BG mostra un p-value borderline (0.07) per il VAR(14), suggerendo assenza di autocorrelazione al 5%.
+
+### Test ARCH
+
+Verifichiamo la presenza di eteroschedasticità condizionale (effetti ARCH) nei residui multivariati.
+
+```{r var_arch}
+cat("VAR(3):\n"); print(arch.test(mod_var3_res, lags.multi = 21))
+cat("\nVAR(7):\n"); print(arch.test(mod_var7_res, lags.multi = 21))
+cat("\nVAR(14):\n"); print(arch.test(mod_var14_res, lags.multi = 21))
+```
+
+I test ARCH mostrano evidenza di eteroschedasticità condizionale, coerentemente con quanto osservato nei test Ljung-Box sui residui al quadrato.
+
+## Test di Causalità di Granger
+
+La causalità di Granger verifica se i valori passati di una variabile aiutano a prevedere un'altra variabile, controllando per i valori passati di quest'ultima. Conduciamo sia test multivariati sia test bivariati pairwise.
+
+```{r var_granger, results='hold', cache=TRUE}
+vars <- c("gas", "pun", "renew")
+p_vec <- c(3, 7, 14)
+
+for(i in seq_along(var_models)){
+  p_i <- p_vec[i]
+ 
+  cat("\n====================================\n")
+  cat("Modello:", var_names[i], "| lag =", p_i, "\n")
+  cat("====================================\n")
+ 
+  # Granger multivariato (VAR completo)
+  cat("\n--- Granger Multivariato (VAR) ---\n")
+  for(cause in vars){
+    cat("\nCausa:", cause, "\n")
+    print(causality(var_models[[i]], cause = cause)$Granger)
+  }
+ 
+  # Granger pairwise bivariato
+  cat("\n--- Granger Pairwise Bivariato ---\n")
+  for(cause in vars){
+    for(effect in vars){
+      if(cause != effect){
+        cat("\n", cause, "$\rightarrow$", effect, "\n")
+        print(grangertest(df_var[, cause], df_var[, effect], order = p_i))
+      }
+    }
+  }
+}
+```
+
+Nei test multivariati condotti sul sistema completo, solo il Gas risulta causare secondo Granger le altre variabili in modo robusto. I test pairwise bivariati mostrano invece relazioni aggiuntive: Gas influenza PUN in tutti i modelli, con una relazione bidirezionale in VAR(7) e VAR(14). Emergono inoltre risultati discordanti tra le altre coppie di variabili, con relazioni che variano al cambiare della specificazione del modello.
+
+Questa apparente contraddizione riflette una differenza metodologica fondamentale: i test pairwise ignorano le interazioni multivariate e possono quindi identificare relazioni spurie o indirette che emergono solo quando si escludono le altre variabili dal condizionamento. Al contrario, i test multivariati forniscono una visione più affidabile della struttura causale del sistema perché considerano simultaneamente tutte le interdipendenze. La sensibilità dei risultati all'ordine del VAR (che diminuisce la potenza del test all'aumentare di p) e l'assunzione di residui White Noise rafforzano ulteriormente l'importanza di privilegiare l'interpretazione dei test multivariati.
+
+## Sintesi e Scelta del Modello
+
+Sulla base dei criteri di informazione, dei test diagnostici e dell'analisi di causalità, il modello VAR(7) emerge come il compromesso ottimale. Esso offre maggiore parsimonia rispetto al VAR(14) con un numero inferiore di parametri da stimare, diagnostica superiore al VAR(3) con residui che si avvicinano maggiormente alle ipotesi di White Noise, capacità di catturare efficacemente le relazioni dinamiche del sistema attraverso la finestra settimanale, e un BIC competitivo che conferma la presenza di un pattern stagionale settimanale persistente.
+
+## Analisi IRF
+
+L'analisi della Funzione di Risposta all'Impulso (IRF) consente di studiare l'effetto dinamico di uno shock su una variabile del sistema sulle altre variabili nel tempo, permettendo di interpretare non solo la direzione e la significatività delle relazioni, ma anche l'ampiezza e la persistenza degli effetti.
+
+```{r irf, results='hold', fig.width=12, fig.height=12, cache=TRUE}
+irf_std <- irf(mod_var7_res,
+               n.ahead = 21,
+               ortho = FALSE,
+               boot = TRUE,
+               runs = 1000)
+par(mfrow = c(3, 3))
+plot(irf_std, plot.type = "single")
+par(mfrow = c(1, 1))
+```
+
+Dall'analisi delle IRF standard emerge che ciascuna variabile risponde principalmente ai propri shock. Il Gas mostra effetti autoregressivi fino a 3 ritardi, le Rinnovabili rispondono in modo persistente esclusivamente a shock su sé stesse, mentre il PUN reagisce sia ai propri shock sia a quelli del Gas, con effetti fino a 3 ritardi.
+
+```{r irf_ortho, results='hold', fig.width=12, fig.height=12, cache=TRUE}
+irf_ortho <- irf(mod_var7_res,
+                 impulse = c("gas", "renew", "pun"),
+                 response = c("gas", "renew", "pun"),
+                 n.ahead = 21,
+                 ortho = TRUE,
+                 boot = TRUE,
+                 runs = 1000)
+par(mfrow = c(3, 3))
+plot(irf_ortho, plot.type = "single")
+par(mfrow = c(1, 1))
+```
+
+L'ortogonalizzazione delle IRF mediante decomposizione di Cholesky produce risultati più chiari e interpretabili. I risultati sul Gas rimangono invariati, confermandone il ruolo di variabile principalmente esogena. Per le Rinnovabili emergono invece effetti più definiti: esse mostrano una risposta persistente a uno shock sul Gas, coerente con la programmazione della produzione rinnovabile che può reagire ai segnali di prezzo del mercato fossile attraverso decisioni di dispacciamento. Il PUN reagisce fino a due ritardi a uno shock delle Rinnovabili, effetto non evidente nelle IRF non ortogonalizzate.
+
+La differenza tra le due specificazioni deriva dall'ortogonalizzazione di Cholesky, che trasforma i residui correlati del VAR in shock decorrelati e interpretabili come innovazioni "pure" di ciascuna variabile. Questo processo isola l'impatto diretto di uno shock da quello indiretto dovuto alla correlazione contemporanea tra residui, facendo emergere relazioni di causalità e la loro persistenza che altrimenti rimarrebbero confuse nella struttura di correlazione del sistema. L'ordinamento delle variabili (Gas, Rinnovabili, PUN) diventa cruciale in questa trasformazione, riflettendo l'assunzione che il Gas non reagisca istantaneamente alle altre variabili, le Rinnovabili possano essere influenzate contemporaneamente dal Gas ma non dal PUN, e il PUN reagisca istantaneamente a entrambe.
+
+## Analisi FEVD
+
+L'analisi della FEVD (Forecast Error Variance Decomposition) quantifica quanto ciascun shock contribuisce alla variabilità futura di ciascuna variabile del sistema.
+
+```{r fevd, results='hold', fig.width=8, fig.height=9, cache=TRUE}
+fevd_result <- fevd(mod_var7_res, n.ahead = 21)
+plot(fevd_result)
+```
+
+I risultati confermano quanto osservato finora: il Gas è influenzato quasi esclusivamente dai propri shock (oltre il 95% della varianza), le Rinnovabili dipendono principalmente da sé stesse con un modesto contributo del Gas (circa 5-10%), mentre il PUN è anch'esso guidato principalmente dalla propria dinamica, con effetti minori provenienti da Gas (circa 10-15%) e Rinnovabili (circa 5%).
+
+Dall'analisi del modello VAR emerge come il sistema catturi efficacemente la struttura trivariata della serie, confermando quanto emerso dall'analisi di cointegrazione e dai modelli a funzioni di trasferimento. Il Gas si conferma come variabile prevalentemente esogena che guida il sistema, le Rinnovabili mostrano una leggera dipendenza dal Gas ma mantengono una dinamica largamente autonoma determinata da fattori climatici e di capacità, mentre il PUN risulta la variabile più endogena, influenzata da entrambe le altre variabili del sistema. La decomposizione della varianza conferma questa gerarchia causale, mostrando come la maggior parte della variabilità di ciascuna variabile sia spiegata dai propri shock, con il Gas che mantiene un ruolo di driver esterno e il PUN che assorbe gli impulsi provenienti da tutte le componenti del mercato energetico.
+
+
+# Confronto Predittivo dei Modelli
+
+In questa sezione confrontiamo la capacità predittiva out-of-sample di tutti i modelli stimati attraverso un'analisi di rolling forecast. Questo approccio permette di valutare le performance dei modelli in condizioni realistiche, simulando previsioni ripetute su finestre temporali mobili.
+
+## Setup e Parametri
+
+Definiamo i parametri principali per l'analisi di rolling forecast. L'orizzonte di previsione è fissato a 14 giorni, la dimensione della finestra di training a 365 giorni, e lo step tra iterazioni a 5 giorni. Questa configurazione genera previsioni multi-step mantenendo una finestra di training sufficientemente ampia per catturare la dinamica del sistema, senza appesantire eccessivamente il carico computazionale. 
+
+L'uso di una finestra di training pari a un anno permette di isolare le osservazioni del 2022, periodo in cui le variabili Gas e PUN hanno subito uno shock improvviso, evitando che l'andamento anomalo influenzi eccessivamente le stime dei modelli nelle finestre temporali più recenti. Lo step di 5 giorni tra iterazioni bilancia la granularità dell'analisi con la sostenibilità computazionale della procedura.
+
+```{r rolling_setup}
+h_max <- 14        
+train_size <- 365    
+step_size <- 5      
+
+target <- log(pun_ts)
+n_total <- length(target)
+
+first_t <- train_size + 1
+last_t <- n_total - h_max
+n_iter <- floor((last_t - first_t + 1) / step_size)
+```
+
+## Rolling Forecast Loop
+
+Implementiamo il rolling forecast per ciascuno dei cinque modelli considerati: ARIMA (modello SARIMA univariato), TFM_Gas (Transfer Function Model con Gas come input), TFM_Renew (Transfer Function Model con Rinnovabili come input), VECM (Vector Error Correction Model tra Gas e PUN con r=1), e VAR (VAR(7) ristretto su serie destagionalizzate).
+
+Per ciascuna iterazione stimiamo il modello sulla finestra di training corrente, generiamo previsioni per i successivi 14 giorni, e calcoliamo gli errori di previsione rispetto ai valori osservati.
+
+Siccome ogni modello è stimato su una trasformazione diversa delle serie (destagionalizzate, differenziate, ...), si è resa necessaria una attenta operazione di trasformazione inversa per rendere confrontabili le previsioni dei vari modelli.
+
+```{r rolling_forecast, cache=TRUE, results='hide', message=TRUE, warning=TRUE}
+models <- c("ARIMA", "TFM_Gas", "TFM_Renew", "VECM", "VAR")
+n_models <- length(models)
+
+residuals_list <- vector("list", n_models)
+names(residuals_list) <- models
+
+for(m in models) {
+  residuals_list[[m]] <- matrix(NA, nrow = n_iter, ncol = h_max)
+}
+
+# Rolling Forecast Loop
+for(ii in 1:n_iter) {
+ 
+  t_end <- first_t + (ii - 1) * step_size - 1
+  t_start <- t_end - train_size + 1
+ 
+  # Training data
+  train_idx <- t_start:t_end
+  test_idx <- (t_end + 1):(t_end + h_max)
+ 
+  # Serie in log
+  l_pun_train <- as.numeric(log(pun_ts)[train_idx])
+  l_gas_train <- as.numeric(log(gas_ts)[train_idx])
+  l_renew_train <- as.numeric(log(renew_ts)[train_idx])
+ 
+  # True values per test
+  y_true <- as.numeric(log(pun_ts)[test_idx])
+ 
+  # ============================================================================
+  # MODELLO 1: ARIMA UNIVARIATO
+  # ============================================================================
+  tryCatch({
+    mod_arima <- Arima(ts(l_pun_train, frequency = 7),
+                       order = c(0, 1, 2),
+                       seasonal = list(order = c(1, 0, 1), period = 7))
+   
+    fc_arima <- forecast(mod_arima, h = h_max)
+    residuals_list[["ARIMA"]][ii, ] <- y_true - as.numeric(fc_arima$mean)
+   
+  }, error = function(e) {})
+ 
+  # ============================================================================
+  # MODELLO 2: TFM GAS $\rightarrow$ PUN
+  # ============================================================================
+  tryCatch({
+    # Destagionalizza PUN
+    pun_ts_train <- ts(l_pun_train, frequency = 7)
+    pun_stl <- stl(pun_ts_train, s.window = "periodic")
+    pun_seasonal <- pun_stl$time.series[, "seasonal"]
+    pun_trend_remainder <- pun_stl$time.series[, "trend"] +
+      pun_stl$time.series[, "remainder"]
+   
+    # Destagionalizza Gas
+    gas_ts_train <- ts(l_gas_train, frequency = 7)
+    gas_stl <- stl(gas_ts_train, s.window = "periodic")
+    gas_deseason <- gas_stl$time.series[, "trend"] +
+      gas_stl$time.series[, "remainder"]
+   
+    # Stima ARIMA su Gas destagionalizzato per forecast
+    mod_gas_arima <- auto.arima(gas_deseason, seasonal = FALSE,
+                                max.p = 3, max.q = 3)
+    fc_gas_deseason <- forecast(mod_gas_arima, h = h_max)
+    gas_deseason_future <- as.numeric(fc_gas_deseason$mean)
+   
+    # Costruisco regressori TFM con lag
+    n_train <- length(pun_trend_remainder)
+   
+    X_train <- cbind(
+      gas_t0 = gas_deseason[2:n_train],
+      gas_t1 = gas_deseason[1:(n_train-1)]
+    )
+    y_train_tfm <- pun_trend_remainder[2:n_train]
+   
+    # Future regressors
+    gas_extended <- c(tail(gas_deseason, 1), gas_deseason_future)
+    X_future <- cbind(
+      gas_t0 = gas_deseason_future,
+      gas_t1 = gas_extended[1:h_max]
+    )
+   
+    # Stima TFM come ARIMA con xreg
+    mod_tfm_gas <- auto.arima(y_train_tfm, xreg = X_train,
+                              seasonal = FALSE,
+                              max.p = 2, max.q = 2)
+   
+    # Forecast
+    fc_tfm <- forecast(mod_tfm_gas, h = h_max, xreg = X_future)
+   
+    # Re-stagionalizza usando pattern stagionale del train
+    pun_seasonal_pattern <- tail(pun_seasonal, 7)
+    pun_seasonal_future <- rep(pun_seasonal_pattern, length.out = h_max)
+   
+    fc_tfm_final <- as.numeric(fc_tfm$mean) + pun_seasonal_future
+   
+    residuals_list[["TFM_Gas"]][ii, ] <- y_true - fc_tfm_final
+   
+  }, error = function(e) {})
+ 
+  # ============================================================================
+  # MODELLO 3: TFM RENEW $\rightarrow$ PUN
+  # ============================================================================
+  tryCatch({
+    # Destagionalizza Renew
+    renew_ts_train <- ts(l_renew_train, frequency = 7)
+    renew_stl <- stl(renew_ts_train, s.window = "periodic")
+    renew_deseason <- renew_stl$time.series[, "trend"] +
+      renew_stl$time.series[, "remainder"]
+   
+    # Forecast Renew destagionalizzato
+    mod_renew_arima <- auto.arima(renew_deseason, seasonal = FALSE,
+                                  max.p = 3, max.q = 3)
+    fc_renew_deseason <- forecast(mod_renew_arima, h = h_max)
+    renew_deseason_future <- as.numeric(fc_renew_deseason$mean)
+   
+    # Costruisco regressori TFM
+    n_train <- length(pun_trend_remainder)
+   
+    X_train_r <- cbind(
+      renew_t0 = renew_deseason[2:n_train],
+      renew_t1 = renew_deseason[1:(n_train-1)]
+    )
+    y_train_tfm_r <- pun_trend_remainder[2:n_train]
+   
+    renew_extended <- c(tail(renew_deseason, 1), renew_deseason_future)
+    X_future_r <- cbind(
+      renew_t0 = renew_deseason_future,
+      renew_t1 = renew_extended[1:h_max]
+    )
+   
+    # Stima e forecast
+    mod_tfm_renew <- auto.arima(y_train_tfm_r, xreg = X_train_r,
+                                seasonal = FALSE,
+                                max.p = 2, max.q = 2)
+    fc_tfm_r <- forecast(mod_tfm_renew, h = h_max, xreg = X_future_r)
+   
+    # Re-stagionalizza
+    fc_tfm_renew_final <- as.numeric(fc_tfm_r$mean) + pun_seasonal_future
+   
+    residuals_list[["TFM_Renew"]][ii, ] <- y_true - fc_tfm_renew_final
+   
+  }, error = function(e) {})
+ 
+  # ============================================================================
+  # MODELLO 4: VECM (r=1 fisso)
+  # ============================================================================
+  tryCatch({
+    # Dataset per cointegrazione
+    data_coint <- ts(cbind(l_pun_train, l_gas_train), frequency = 7)
+    colnames(data_coint) <- c("l_PUN", "l_Gas")
+   
+    # Test Johansen
+    vecm_test <- ca.jo(data_coint, type = "trace", ecdet = "const",
+                       K = 14, spec = "longrun")
+   
+    # Converti a VAR con r=1 fisso
+    vecm_var <- vec2var(vecm_test, r = 1)
+   
+    # Previsione
+    fc_vecm <- predict(vecm_var, n.ahead = h_max)
+    fc_vecm_pun <- fc_vecm$fcst$l_PUN[, "fcst"]
+   
+    residuals_list[["VECM"]][ii, ] <- y_true - fc_vecm_pun
+   
+  }, error = function(e) {})
+ 
+  # ============================================================================
+  # MODELLO 5: VAR(7) RESTRICTED
+  # ============================================================================
+  tryCatch({
+    # Differenze prima
+    gas_diff <- diff(l_gas_train)
+    pun_diff <- diff(l_pun_train)
+    renew_log <- l_renew_train[-1]  # allinea
+   
+    # Destagionalizza sul train
+    gas_diff_ts <- ts(gas_diff, frequency = 7)
+    pun_diff_ts <- ts(pun_diff, frequency = 7)
+    renew_ts_var <- ts(renew_log, frequency = 7)
+   
+    stl_gas_train <- stl(gas_diff_ts, s.window = "periodic")
+    stl_pun_train <- stl(pun_diff_ts, s.window = "periodic")
+    stl_renew_train <- stl(renew_ts_var, s.window = "periodic")
+   
+    gas_ds <- stl_gas_train$time.series[, "trend"] +
+      stl_gas_train$time.series[, "remainder"]
+    pun_ds <- stl_pun_train$time.series[, "trend"] +
+      stl_pun_train$time.series[, "remainder"]
+    renew_ds <- stl_renew_train$time.series[, "trend"] +
+      stl_renew_train$time.series[, "remainder"]
+   
+    # VAR su dati destagionalizzati
+    df_var <- ts(cbind(gas_ds, pun_ds, renew_ds), frequency = 7)
+    colnames(df_var) <- c("gas", "pun", "renew")
+   
+    mod_var <- vars::VAR(df_var, p = 7, type = "const")
+    mod_var_res <- restrict(mod_var, method = "ser", thresh = 1.96)
+   
+    # Forecast
+    fc_var <- predict(mod_var_res, n.ahead = h_max)
+    fc_pun_ds <- fc_var$fcst$pun[, "fcst"]
+   
+    # Re-stagionalizza usando pattern del train
+    pun_seasonal_pattern_var <- tail(stl_pun_train$time.series[, "seasonal"], 7)
+    pun_seasonal_future_var <- rep(pun_seasonal_pattern_var, length.out = h_max)
+   
+    fc_pun_reseason <- fc_pun_ds + pun_seasonal_future_var
+   
+    # Back-transform da diff a levels
+    last_log_pun <- tail(l_pun_train, 1)
+    fc_pun_levels <- cumsum(c(last_log_pun, fc_pun_reseason))[-1]
+   
+    residuals_list[["VAR"]][ii, ] <- y_true - fc_pun_levels
+   
+  }, error = function(e) {})
+ 
+}
+```
+
+Il rolling forecast è stato completato su `r n_iter` iterazioni. Eventuali fallimenti nella stima sono registrati come valori mancanti e verranno esclusi dal calcolo delle metriche. Tali fallimenti nella stima sono imputabili alla copertura di finestre temporali caratterizzate da forte volatilità, che rende le stime instabili.
+
+## Metriche di Performance
+
+Calcoliamo le metriche Mean Absolute Error (MAE) e Root Mean Squared Error (RMSE) per ciascun orizzonte di previsione (h=1 a h=14) e in media.
+
+```{r metrics_calculation, cache=TRUE}
+lag_names_mae <- paste0("MAE_h", 1:14)
+lag_names_rmse <- paste0("RMSE_h", 1:14)
+
+mae_summary <- data.frame(matrix(NA, nrow = n_models, ncol = 17))
+colnames(mae_summary) <- c("Model", lag_names_mae, "MAE_Avg", "N_valid")
+mae_summary$Model <- models
+
+rmse_summary <- data.frame(matrix(NA, nrow = n_models, ncol = 17))
+colnames(rmse_summary) <- c("Model", lag_names_rmse, "RMSE_Avg", "N_valid")
+rmse_summary$Model <- models
+
+# Loop di Calcolo
+for(i in 1:n_models) {
+  model_name <- models[i]
+  res_mat <- residuals_list[[model_name]]
+ 
+  # Rimuovi righe con NA
+  valid_rows <- complete.cases(res_mat)
+  res_clean <- res_mat[valid_rows, , drop = FALSE]
+ 
+  n_valid <- nrow(res_clean)
+ 
+  if(n_valid > 0) {
+    # Calcolo MAE
+    maes_lags <- colMeans(abs(res_clean[, 1:14]))
+    mae_avg <- mean(abs(res_clean))
+   
+    mae_summary[i, 2:15] <- maes_lags
+    mae_summary[i, "MAE_Avg"] <- mae_avg
+    mae_summary[i, "N_valid"] <- n_valid
+   
+    # Calcolo RMSE
+    rmses_lags <- sqrt(colMeans(res_clean[, 1:14]^2))
+    rmse_avg <- sqrt(mean(res_clean^2))
+   
+    rmse_summary[i, 2:15] <- rmses_lags
+    rmse_summary[i, "RMSE_Avg"] <- rmse_avg
+    rmse_summary[i, "N_valid"] <- n_valid
+  }
+}
+```
+
+### Risultati MAE
+
+```{r mae_table}
+mae_transposed <- data.frame(
+  Orizzonte = c(paste0("h", 1:14), "Media", "N_valid"),
+  t(mae_summary[, -1])
+)
+colnames(mae_transposed)[-1] <- mae_summary$Model
+
+knitr::kable(mae_transposed, digits = 4,
+             caption = "Mean Absolute Error per orizzonte di previsione",
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+### Risultati RMSE
+
+```{r rmse_table}
+rmse_transposed <- data.frame(
+  Orizzonte = c(paste0("h", 1:14), "Media", "N_valid"),
+  t(rmse_summary[, -1])
+)
+colnames(rmse_transposed)[-1] <- rmse_summary$Model
+
+knitr::kable(rmse_transposed, digits = 4,
+             caption = "Root Mean Squared Error per orizzonte di previsione",
+             booktabs = TRUE) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+## Visualizzazione Risultati
+
+Visualizziamo graficamente l'andamento degli errori MAE e RMSE per ciascun orizzonte di previsione.
+
+```{r performance_plots, fig.width=10, fig.height=5, out.width="100%"}
+par(mfrow = c(1, 2))
+
+# Grafico RMSE per Orizzonte
+rmse_matrix_plot <- t(rmse_summary[, 2:15])
+
+matplot(rmse_matrix_plot, type = "b", pch = 19,
+        xlab = "Orizzonte (h)", ylab = "RMSE",
+        main = "RMSE per Orizzonte di Previsione",
+        col = 1:n_models, lty = 1, xaxt = "n")
+axis(1, at = 1:14, labels = 1:14)
+legend("topleft", legend = models, col = 1:n_models,
+       lty = 1, pch = 19, cex = 0.7, bty = "n")
+grid()
+
+mae_matrix_plot <- t(mae_summary[, 2:15])
+
+matplot(mae_matrix_plot, type = "b", pch = 19,
+        xlab = "Orizzonte (h)", ylab = "MAE",
+        main = "MAE per Orizzonte di Previsione",
+        col = 1:n_models, lty = 1, xaxt = "n")
+axis(1, at = 1:14, labels = 1:14)
+legend("topleft", legend = models, col = 1:n_models,
+       lty = 1, pch = 19, cex = 0.7, bty = "n")
+grid()
+
+par(mfrow = c(1, 1))
+```
+
+Le tabelle e i grafici convergono su un quadro coerente delle performance predittive. Il modello a funzioni di trasferimento con variabile di input Gas (TFM_Gas) risulta generalmente il più preciso su tutti gli orizzonti di previsione, con RMSE e MAE inferiori rispetto agli altri modelli. L'andamento degli errori al crescere dell'orizzonte temporale mostra una sostanziale stabilità per TFM_Gas, mentre gli altri modelli mostrano performance comparabili, leggermente peggiori del TFM_Gas. Questi risultati confermano quanto osservato nelle analisi precedenti: il Gas è la variabile principale in grado di spiegare le dinamiche del PUN, rendendo il modello a funzione di trasferimento con Gas come input quello più efficace sia nel breve che nel medio termine.
+
+## Test di Diebold-Mariano
+
+Per valutare se le differenze di performance tra i modelli sono statisticamente significative, conduciamo il test di Diebold-Mariano confrontando i due modelli con RMSE medio più basso.
+
+```{r dm_test, cache=TRUE}
+valid_models <- rmse_summary[!is.na(rmse_summary$RMSE_Avg), ]
+top2_idx <- order(valid_models$RMSE_Avg)[1:2]
+top2_models <- valid_models$Model[top2_idx]
+
+dm_results <- data.frame(
+  Horizon = integer(),
+  DM_Statistic = numeric(),
+  P_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for(h in 1:h_max) {
+  res1 <- residuals_list[[top2_models[1]]][, h]
+  res2 <- residuals_list[[top2_models[2]]][, h]
+ 
+  valid_idx <- !is.na(res1) & !is.na(res2)
+  res1_clean <- res1[valid_idx]
+  res2_clean <- res2[valid_idx]
+ 
+  if(length(res1_clean) > 30) {
+    dm_test <- dm.test(res1_clean, res2_clean,
+                       alternative = "two.sided", h = h)
+   
+    dm_results <- rbind(dm_results,
+                       data.frame(
+                         Horizon = h,
+                         DM_Statistic = dm_test$statistic,
+                         P_Value = dm_test$p.value
+                       ))
+  }
+}
+```
+
+```{r dm_table}
+knitr::kable(
+  dm_results,
+  digits = 4,
+  caption = paste(
+  "Test di Diebold-Mariano:",
+  gsub("_", "\\\\_", top2_models[1]),
+  "vs",
+  gsub("_", "\\\\_", top2_models[2])
+),
+  booktabs = TRUE,
+  escape = TRUE
+)
+
+```
+
+Per tutti i 14 orizzonti di previsione, la statistica test risulta significativamente negativa, indicando una migliore capacità predittiva del modello `r top2_models[1]` rispetto a `r top2_models[2]` (secondo miglior modello). I p-value estremamente bassi confermano che la superiorità del primo modello non è dovuta al caso ma riflette una reale differenza strutturale nella capacità di catturare le dinamiche del PUN. Pertanto, concludiamo che il modello a funzione di trasferimento con Gas come variabile esplicativa è il più efficace tra quelli stimati, offrendo previsioni più accurate e stabili su tutto l'orizzonte temporale considerato.
+
+
+# Conclusioni
+
+Questo studio ha analizzato le relazioni dinamiche tra prezzo del Gas naturale, produzione da Rinnovabili e Prezzo Unico Nazionale dell'energia elettrica nel mercato italiano durante il quinquennio 2021-2025, un periodo caratterizzato da turbolenze straordinarie dovute alla crisi energetica globale.
+
+L'analisi univariata mediante modelli SARIMA ha rivelato marcata stagionalità settimanale in tutte le serie, riflesso della struttura dei consumi e della programmazione del mercato elettrico. Tuttavia, la forte eteroschedasticità e gli shock esogeni del 2022 hanno evidenziato i limiti dei modelli lineari univariati.
+
+L'analisi di cointegrazione ha confermato l'esistenza di una relazione di equilibrio di lungo periodo tra il prezzo del Gas e il PUN, con un'elasticità stimata attorno allo 0.84. La produzione rinnovabile, risultata stazionaria nei livelli, è stata esclusa dalla relazione di cointegrazione, suggerendo che il suo impatto sul PUN si manifesti principalmente attraverso dinamiche di breve periodo. Il Gas si è confermato come variabile debolmente esogena, guidando il sistema senza reagire agli squilibri, mentre il PUN si comporta come variabile endogena che assorbe gli shock con una velocità di aggiustamento del 13% per periodo.
+
+I modelli a funzione di trasferimento hanno isolato le relazioni causali unidirezionali verso il PUN. Il modello Gas $\rightarrow$ PUN ha evidenziato un impatto immediato (0.54%) seguito da un effetto ritardato (0.24%), confermando il ruolo dominante del Gas nella formazione del prezzo elettrico. Il modello Rinnovabili $\rightarrow$ PUN ha mostrato una struttura più complessa, con un effetto positivo contemporaneo seguito da un effetto negativo ritardato, suggerendo dinamiche di compensazione che meriterebbero ulteriori approfondimenti con dati ad alta frequenza.
+
+L'analisi VAR multivariata ha catturato le interdipendenze dinamiche tra le tre variabili. Il modello VAR(7) ristretto ha confermato la gerarchia causale emersa dalle analisi precedenti. Le funzioni di risposta all'impulso ortogonalizzate hanno rivelato come il PUN reagisca immediatamente agli shock del Gas e delle Rinnovabili, mentre queste ultime mostrano una risposta persistente agli shock del Gas. La decomposizione della varianza ha confermato che ciascuna variabile è guidata principalmente dai propri shock, con il Gas che mantiene un'influenza del 10-15% sul PUN e le Rinnovabili che contribuiscono per circa il 5%.
+
+Il confronto predittivo out-of-sample ha fornito evidenza sulla superiorità del modello a funzione di trasferimento con Gas come input (TFM_Gas). L'analisi di rolling forecast su 14 giorni ha mostrato errori RMSE e MAE sistematicamente inferiori su ogni orizzonte temporale. Il test di Diebold-Mariano ha confermato statisticamente che tale superiorità riflette una reale maggiore capacità di catturare le dinamiche del PUN.
+
+Questi risultati confermano che il prezzo del gas naturale rimane il principale driver del PUN, rendendo fondamentale il monitoraggio dei mercati internazionali del gas. Nonostante la crescente penetrazione delle fonti rinnovabili, il loro impatto sulla formazione del prezzo rimane secondario e mediato da meccanismi complessi di dispacciamento. La superiorità predittiva del modello TFM_Gas fornisce uno strumento operativo efficace per la previsione di breve-medio termine del PUN.
+
+Lo studio presenta limitazioni che suggeriscono direzioni per ricerche future. La frequenza giornaliera dei dati non permette di catturare le dinamiche intra-giornaliere del mercato elettrico, particolarmente rilevanti per comprendere l'impatto delle rinnovabili. L'uso di dati orari potrebbe rivelare pattern più sofisticati. La presenza di eteroschedasticità persistente suggerisce che modelli GARCH multivariati o di switching regime potrebbero catturare meglio la volatilità del sistema. L'inclusione di variabili aggiuntive come la domanda di energia elettrica, la capacità di interconnessione e variabili meteorologiche potrebbe arricchire il quadro interpretativo e migliorare la capacità predittiva dei modelli.
+
+## Uso dell'AI
+
+Nella produzione di questa relazione sono stati usati i seguenti strumenti di intelligenza artificiale generativa: Claude, Gemini, ChatGPT. Le finalità sono state le seguenti:
+
+* Brainstorming iniziale per confrontare diverse idee
+
+* Aiuto nell'individuazione delle banche dati necessarie
+
+* Automazione ed efficientazione di alcune parti del codice (ad esempio, importazione e pulizia dati, o il ciclo del rolling forecast)
+
+* Velocizzazione nella stesura del codice Markdown
+
+* Validazione delle conclusioni tratte dai modelli
+
+* Aiuto nel rendere più scorrevole la scrittura
+
+* Controllo finale per incongruenze concettuali ed errori grammaticali

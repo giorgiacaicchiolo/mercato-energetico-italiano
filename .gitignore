@@ -1,0 +1,29 @@
+# ---- Dati grezzi (non versionati: pesanti e riscaricabili dai portali) ----
+data/raw/
+
+# ---- R ----
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# ---- Output R Markdown / knitr / LaTeX ----
+*_cache/
+*_files/
+*.log
+*.aux
+*.out
+*.toc
+*.synctex.gz
+# PDF: versioniamo solo il report finale in reports/, non i PDF generati altrove
+/*.pdf
+
+# ---- Sistema operativo ----
+.DS_Store
+Thumbs.db
+
+# ---- File di lavoro (non parte del progetto pubblicato) ----
+# Scheda CV: uso personale, non va nel repo pubblico
+cv-entry.md
